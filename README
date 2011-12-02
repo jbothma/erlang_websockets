@@ -1,0 +1,7 @@
+Erlang websocket implementation.
+
+Compatible with hybi 10 and 17.
+
+Client is working, although needs a tiny change for hybi 17 handshake.
+
+Server needs the handshake code in my yaws websocket callback_interface branch.
