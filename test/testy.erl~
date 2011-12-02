@@ -1,0 +1,11 @@
+-module(testy).
+
+-include_lib("eunit/include/eunit.hrl").
+
+bob_test() ->
+
+testy() ->
+    {ok, Pid} test_client:connect(
+    Term = ?JSON_LOGIN("bob", "pass"),
+    JSON = mochijson2:encode(Term),
+    Msg = list_to_binary(JSON).

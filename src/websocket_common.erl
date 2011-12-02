@@ -1,55 +1,17 @@
-%%%----------------------------------------------------------------------
-%%% File    : yaws_websockets.erl
-%%% Author  : Davide Marques <nesrait@gmail.com>
-%%% Purpose :
-%%% Created :  18 Dec 2009 by Davide Marques <nesrait@gmail.com>
-%%% Modified:
-%%%----------------------------------------------------------------------
+-module(websocket_common).
 
--module(yaws_websockets).
--author('nesrait@gmail.com').
-
--include("../include/yaws.hrl").
--include("../include/yaws_api.hrl").
--include("yaws_debug.hrl").
-
--include_lib("kernel/include/file.hrl").
+-include("websocket.hrl").
 
 -define(MAX_PAYLOAD, 16777216). %16MB
 
 %% API
--export([start/3, send/2]).
+-export([hash_nonce/1, loop/4, send/2]).
 
-%% Exported for spawn
--export([receive_control/4]).
 
-start(Arg, CallbackMod, Opts) ->
-    SC = get(sc),
-    CliSock = Arg#arg.clisock,
-    PrepdOpts = preprocess_opts(Opts),
-    OwnerPid = spawn(?MODULE, receive_control, [Arg, SC, CallbackMod, PrepdOpts]),
-    CliSock = Arg#arg.clisock,
-    case SC#sconf.ssl of
-        undefined ->
-            inet:setopts(CliSock, [{packet, raw}, {active, once}]),
-            TakeOverResult =
-                gen_tcp:controlling_process(CliSock, OwnerPid);
-        _ ->
-            ssl:setopts(CliSock, [{packet, raw}, {active, once}]),
-            TakeOverResult =
-                ssl:controlling_process(CliSock, OwnerPid)
-    end,
-    case TakeOverResult of
-        ok ->
-            OwnerPid ! ok,
-            exit(normal);
-        {error, Reason} ->
-            OwnerPid ! {error, Reason},
-            exit({websocket, Reason})
-    end.
-
-send(#ws_state{sock=Socket, vsn=ProtoVsn}, {Type, Data}) ->
-    DataFrame = frame(ProtoVsn, Type,  Data),
+send(#ws_state{sock=Socket,
+               vsn=ProtoVsn,
+               endpoint=EndpointType}, {FrameType, Data}) ->
+    DataFrame = frame(ProtoVsn, FrameType,  Data, EndpointType),
     case Socket of
         {sslsocket,_,_} ->
             ssl:send(Socket, DataFrame);
@@ -58,83 +20,9 @@ send(#ws_state{sock=Socket, vsn=ProtoVsn}, {Type, Data}) ->
     end;
 
 send(Pid, {Type, Data}) ->
-    Pid ! {send, {Type, Data}}.
+    Pid ! {send, {Type, Data}},
+    ok.
 
-preprocess_opts(GivenOpts) ->
-    Fun = fun({Key, Default}, Opts) ->
-                  case lists:keyfind(Key, 1, Opts) of
-                      false ->
-                          [{Key, Default}|Opts];
-                      _ -> Opts
-                  end
-          end,
-    Defaults = [{origin, any},
-                {callback, basic}],
-    lists:foldl(Fun, GivenOpts, Defaults).
-
-receive_control(Arg, SC, CallbackMod, Opts) ->
-    receive
-        ok ->
-            handshake(Arg, SC, CallbackMod, Opts);
-        {error, Reason} ->
-            exit(Reason)
-    end.
-
-handshake(Arg, SC, CallbackMod, Opts) ->
-    CliSock = Arg#arg.clisock,
-    OriginOpt = lists:keyfind(origin, 1, Opts),
-    Origin = get_origin_header(Arg#arg.headers),
-    case origin_check(Origin, OriginOpt) of
-        {error, Error} ->
-            error_logger:error_msg(Error),
-            exit({error, Error});
-        ok ->
-            ProtocolVersion = ws_version(Arg#arg.headers),
-            Protocol = get_protocol_header(Arg#arg.headers),
-            Host = (Arg#arg.headers)#headers.host,
-            {abs_path, Path} = (Arg#arg.req)#http_request.path,
-
-            WebSocketLocation =
-                case SC#sconf.ssl of
-                    undefined -> "ws://" ++ Host ++ Path;
-                    _ -> "wss://" ++ Host ++ Path
-                end,
-
-            Handshake = handshake(ProtocolVersion, Arg, CliSock,
-                                  WebSocketLocation, Origin, Protocol),
-            gen_tcp:send(CliSock, Handshake), % TODO: use the yaws way of supporting normal 
-                                              % and ssl sockets
-            {callback, CallbackType} = lists:keyfind(callback, 1, Opts),
-            WSState = #ws_state{ sock = CliSock, 
-                               vsn  = ProtocolVersion,
-                               frag_type = none
-                             },
-            CallbackState = case CallbackType of
-                               basic ->
-                                    {none, <<>>};
-                                {advanced, InitialState} ->
-                                    InitialState
-                            end,
-            loop(CallbackMod, WSState, CallbackState, CallbackType)
-    end.
-
-origin_check(_Origin, {origin, any}) ->
-    ok;
-origin_check(Actual, {origin, _Expected=Actual}) ->
-    ok;
-origin_check(Actual, {origin, Expected}) ->
-    Error = io_lib:format("Expected origin ~p but found ~p.",
-                          [Expected, Actual]),
-    {error, Error}.
-
-handshake(8, Arg, _CliSock, _WebSocketLocation, _Origin, _Protocol) ->
-    Key = get_nonce_header(Arg#arg.headers),
-    AcceptHash = hash_nonce(Key), 
-    ["HTTP/1.1 101 Switching Protocols\r\n",
-     "Upgrade: websocket\r\n",
-     "Connection: Upgrade\r\n",
-     "Sec-WebSocket-Accept: ", AcceptHash , "\r\n",
-     "\r\n"].
 
 loop(CallbackMod, WSState = #ws_state{sock=Socket}, CallbackState, CallbackType) ->
     receive
@@ -145,13 +33,13 @@ loop(CallbackMod, WSState = #ws_state{sock=Socket}, CallbackState, CallbackType)
             FrameInfos = unframe_active_once(WSState, FirstPacket),
             case CallbackType of
                 basic ->
-                    {BasicMessages, NewCallbackState} = 
+                    {BasicMessages, NewCallbackState} =
                         basic_messages(FrameInfos, CallbackState),
                     CallbackResults = lists:map({CallbackMod, handle_message}, BasicMessages),
                     lists:map(handle_result_fun(WSState), CallbackResults);
                 {advanced,_} ->
                     NewCallbackState = lists:foldl(do_callback_fun(WSState, CallbackMod), 
-                                                   CallbackState, 
+                                                   CallbackState,
                                                    FrameInfos)
             end,
             Last = lists:last(FrameInfos),
@@ -197,8 +85,8 @@ basic_messages(FrameInfos, {FragType, FragAcc}) ->
     {Messages, {NewFragType, NewFragAcc}}.
 
 %% start of a fragmented message
-handle_message( #ws_frame_info{ fin=0, 
-                                opcode=FragType, 
+handle_message( #ws_frame_info{ fin=0,
+                                opcode=FragType,
                                 data=Data },
                 {Messages, none, <<>>}) ->
     {Messages, FragType, Data};
@@ -211,8 +99,8 @@ handle_message( #ws_frame_info{ fin=0,
     {Messages, FragType, <<FragAcc/binary,Data/binary>>};
 
 %% end of text fragmented message
-handle_message( #ws_frame_info{ fin=1, 
-                                opcode=continuation, 
+handle_message( #ws_frame_info{ fin=1,
+                                opcode=continuation,
                                 data=Data
                               },
                 {Messages, text, FragAcc}) ->
@@ -227,8 +115,8 @@ handle_message( #ws_frame_info{opcode=text, data=Data},
     {[NewMessage | Messages], none, <<>>};
 
 %% end of binary fragmented message
-handle_message( #ws_frame_info{ fin=1, 
-                                opcode=continuation, 
+handle_message( #ws_frame_info{ fin=1,
+                                opcode=continuation,
                                 data=Data
                               },
                 {Messages, binary, FragAcc}) ->
@@ -236,16 +124,16 @@ handle_message( #ws_frame_info{ fin=1,
     NewMessage = {binary, Unfragged},
     {[NewMessage|Messages], none, <<>>};
 
-handle_message( #ws_frame_info{ opcode=binary, 
+handle_message( #ws_frame_info{ opcode=binary,
                                 data=Data
-                              }, 
+                              },
                 {Messages, none, <<>>}) ->
     NewMessage = {binary, Data},
     {[NewMessage|Messages], none, <<>>};
 
-handle_message( #ws_frame_info{ opcode=ping, 
+handle_message( #ws_frame_info{ opcode=ping,
                                 data=Data,
-                                ws_state=State}, 
+                                ws_state=State},
                 Acc) ->
     io:format("Replying pong to ping on behalf of basic callback module.~n",[]),
     send(State, {pong, Data}),
@@ -262,27 +150,16 @@ handle_message(FrameInfo=#ws_frame_info{}, Acc) ->
               [FrameInfo, Acc]),
     Acc.
 
-    
-
-ws_version(Headers) ->
-    VersionVal = query_header("sec-websocket-version", Headers),
-    io:format("Version header value: ~s~n",[VersionVal]),
-    case VersionVal of
-        "8" -> 8;
-        "13" -> 8 % treat 13 like 8. Right now 13 support is as good as that of 8,
-                  % according to autobahn 0.4.3
-    end.
-
 buffer(Socket, Len, Buffered) ->
-    case Buffered of 
+    case Buffered of
         <<_Expected:Len/binary>> = Return -> % exactly enough
-            %debug(val, {buffering, "got:", Len}),
+%            debug(val, {buffering, "got:", Len}),
             Return;
         <<_Expected:Len/binary,_Extra/binary>> = Return-> % more than expected
-            %debug(val, {buffering, "got:", Len, "and more!"}),
+%            debug(val, {buffering, "got:", Len, "and more!"}),
             Return;
         _ -> % not enough
-            %debug(val, {buffering, "need:", Len, "waiting for more..."}),
+%            debug(val, {buffering, "need:", Len, "waiting for more..."}),
             % TODO: take care of ssl sockets
             Needed = Len - binary_length(Buffered),
             {ok, More} = gen_tcp:recv(Socket, Needed),
@@ -334,18 +211,18 @@ check_reserved_opcode(Unframed) ->
     Unframed.
 
 
-ws_frame_info(#ws_state{sock=Socket}, 
+ws_frame_info(#ws_state{sock=Socket, endpoint=EndpointType},
               <<Fin:1, Rsv:3, Opcode:4, Masked:1, Len1:7, Rest/binary>>) ->
     case check_control_frame(Len1, Opcode, Fin) of
         ok ->
-            {ws_frame_info_secondary, Length, MaskingKey, Payload, Excess} 
-                = ws_frame_info_secondary(Socket, Len1, Rest),
-            FrameInfo = #ws_frame_info{fin=Fin, 
-                                    rsv=Rsv, 
+            {ws_frame_info_secondary, Length, MaskingKey, Payload, Excess}
+                = ws_frame_info_secondary(Socket, Len1, Rest, EndpointType),
+            FrameInfo = #ws_frame_info{fin=Fin,
+                                    rsv=Rsv,
                                     opcode=opcode_to_atom(Opcode),
-                                    masked=Masked, 
-                                    masking_key=MaskingKey, 
-                                    length=Length, 
+                                    masked=Masked,
+                                    masking_key=MaskingKey,
+                                    length=Length,
                                     payload=Payload},
             {FrameInfo, Excess};
         Other ->
@@ -354,25 +231,34 @@ ws_frame_info(#ws_state{sock=Socket},
 
 ws_frame_info(State = #ws_state{sock=Socket}, FirstPacket) ->
     ws_frame_info(State, buffer(Socket, 2,FirstPacket)).
-            
-ws_frame_info_secondary(Socket, Len1, Rest) ->
+
+ws_frame_info_secondary(Socket, Len1, Rest, EndpointType) ->
+    case EndpointType of
+        client ->
+            MaskingKeyLen = 0;
+        server ->
+            MaskingKeyLen = 4
+    end,
     case Len1 of
         126 ->
-            <<Len:16, MaskingKey:4/binary, Rest2/binary>> = buffer(Socket, 6, Rest);
+            <<Len:16, MaskingKey:MaskingKeyLen/binary, Rest2/binary>> =
+                buffer(Socket, MaskingKeyLen+2, Rest);
         127 ->
-            <<Len:64, MaskingKey:4/binary, Rest2/binary>> = buffer(Socket, 12, Rest);
+            <<Len:64, MaskingKey:MaskingKeyLen/binary, Rest2/binary>> =
+                buffer(Socket, MaskingKeyLen+8, Rest);
         Len ->
-            <<MaskingKey:4/binary, Rest2/binary>> = buffer(Socket, 4, Rest)
+            <<MaskingKey:MaskingKeyLen/binary, Rest2/binary>> =
+                buffer(Socket, MaskingKeyLen, Rest)
     end,
     if
-	Len > ?MAX_PAYLOAD ->
-	    Error = io_lib:format("Payload length ~p longer than max allowed of ~p",
-				  [Len, ?MAX_PAYLOAD]),
-	    io:format(Error, []),
-	    exit({error, Error});
-	true ->
-	    <<Payload:Len/binary, Excess/binary>> = buffer(Socket, Len, Rest2),
-	    {ws_frame_info_secondary, Len, MaskingKey, Payload, Excess}
+    Len > ?MAX_PAYLOAD ->
+        Error = io_lib:format("Payload length ~p longer than max allowed of ~p",
+                  [Len, ?MAX_PAYLOAD]),
+        io:format(Error),
+        exit({error, Error});
+    true ->
+        <<Payload:Len/binary, Excess/binary>> = buffer(Socket, Len, Rest2),
+        {ws_frame_info_secondary, Len, MaskingKey, Payload, Excess}
     end.
 
 unframe_active_once(State, FirstPacket) ->
@@ -400,13 +286,18 @@ unframe(State, FirstPacket) ->
     end.
 
 % -> {#ws_frame_info, RestBin} | {fail_connection, Reason}
-unframe_one(State = #ws_state{vsn=8}, FirstPacket) ->
+unframe_one(State = #ws_state{vsn=8, endpoint=EndpointType}, FirstPacket) ->
     {FrameInfo = #ws_frame_info{}, RestBin} = ws_frame_info(State, FirstPacket),
-    Unmasked = mask(FrameInfo#ws_frame_info.masking_key, FrameInfo#ws_frame_info.payload),
+    Unmasked = case EndpointType of
+                   server ->
+                       mask(FrameInfo#ws_frame_info.masking_key,
+                            FrameInfo#ws_frame_info.payload);
+                   client ->
+                       FrameInfo#ws_frame_info.payload
+               end,
     NewState = frag_state_machine(State, FrameInfo),
     Unframed = FrameInfo#ws_frame_info{ data = Unmasked,
                                         ws_state = NewState },
-
     case checks(Unframed) of
         #ws_frame_info{} when is_record(NewState, ws_state) ->
             {Unframed, RestBin};
@@ -468,7 +359,7 @@ frag_state_machine(State = #ws_state{ frag_type = binary },
 
 frag_state_machine(State, #ws_frame_info{ opcode = Op }) ->
     IsControl = is_control_op(Op),
-    if 
+    if
         IsControl == true ->
             %% Control message never changes fragmentation state
             State;
@@ -494,24 +385,33 @@ atom_to_opcode(ping) -> 16#9;
 atom_to_opcode(pong) -> 16#A.
 
 
-frame(8, Type, Data) ->
+frame(8, FrameType, Data, EndpointType) ->
     %FIN=true because we're not fragmenting.
-    %OPCODE=1 for text
-    FirstByte = 128 bor atom_to_opcode(Type),
+    FirstByte = 128 bor atom_to_opcode(FrameType),
     ByteList = binary_to_list(Data),
     Length = length(ByteList),
+    case EndpointType of
+        client ->
+            MaskingKey = crypto:rand_bytes(4),
+            Payload = mask(MaskingKey, Data),
+            MaskedBit = 1;
+        server ->
+            MaskingKey = <<>>,
+            Payload = Data,
+            MaskedBit = 0
+    end,
     if
         Length < 126 ->
-            << FirstByte, 0:1, Length:7, Data:Length/binary >>;
+            << FirstByte, MaskedBit:1, Length:7, MaskingKey/binary, Payload:Length/binary >>;
         Length =< 65535 ->
-            << FirstByte, 0:1, 126:7, Length:16, Data:Length/binary >>;
+            << FirstByte, MaskedBit:1, 126:7, Length:16, MaskingKey/binary, Payload:Length/binary >>;
         true ->
             Defined = Length =< math:pow(2,64),
-            % TODO: Is the correctness of this pow call 
+            % TODO: Is the correctness of this pow call
             % better than the speed and danger of not checking?
             case Defined of
                 true ->
-                    << FirstByte, 0:1, 127:7, Length:64, Data:Length/binary >>;
+                    << FirstByte, MaskedBit:1, 127:7, Length:64, MaskingKey/binary, Payload:Length/binary >>;
                 _ ->
                     undefined
             end
@@ -542,40 +442,6 @@ rmask(<<Mask:1/integer-unit:8, _Rest/binary>>, <<Data:1/integer-unit:8>>) ->
     Masked = Mask bxor Data,
     [<<Masked:1/integer-unit:8>>].
 
-
-%% Internal functions
-get_origin_header(Headers) ->
-    case query_header("origin", Headers) of
-        undefined -> query_header("sec-websocket-origin", Headers);
-        Origin    -> Origin
-    end.
-
-get_protocol_header(Headers) ->
-    query_header("sec-websocket-protocol", Headers, "unknown").
-
-get_nonce_header(Headers) ->
-    query_header("sec-websocket-key", Headers).
-
-query_header(HeaderName, Headers) ->
-    query_header(HeaderName, Headers, undefined).
-
-query_header(Header, #headers{other=L}, Default) ->
-    lists:foldl(fun({http_header,_,K0,_,V}, undefined) ->
-                        K = case is_atom(K0) of
-                                true ->
-                                    atom_to_list(K0);
-                                false ->
-                                    K0
-                            end,
-                        case string:to_lower(K) of
-                            Header ->
-                                V;
-                            _ ->
-                                Default
-                        end;
-                   (_, Acc) ->
-                        Acc
-                end, Default, L).
 
 hash_nonce(Nonce) ->
     Salted = Nonce ++ "258EAFA5-E914-47DA-95CA-C5AB0DC85B11",
